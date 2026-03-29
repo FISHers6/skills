@@ -1,6 +1,6 @@
 ---
 name: keynote-to-remotion
-description: Use when converting a Keynote presentation into a Remotion video project, or debugging transpiler visual bugs. Triggers: elements in wrong position, text in top-left corner, wrong scale/rotation origin, white backgrounds on transparent PNGs, animated elements staying invisible, character-by-character animation overlap, position double-counted in nested divs.
+description: "Use when converting a Keynote presentation into a Remotion video project, or debugging transpiler visual bugs. Triggers: elements in wrong position, text in top-left corner, wrong scale/rotation origin, white backgrounds on transparent PNGs, animated elements staying invisible, character-by-character animation overlap, position double-counted in nested divs."
 ---
 
 # Keynote → Remotion Transpiler
