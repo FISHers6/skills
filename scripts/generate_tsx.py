@@ -453,25 +453,6 @@ def _gen_layer(
         _emit_timed_interpolate(lines, f'{p}_cop', 1, 0, contents_anim, start_offset_frames, fps)
         lines[-1] += ' // contents A → B'
 
-    # Build CSS style
-    style_parts = [
-        f'position:"absolute"',
-        f'left:{_fmt(left)}',
-        f'top:{_fmt(top)}',
-        f'width:{_fmt(w)}',
-        f'height:{_fmt(h)}',
-    ]
-
-    if animated_opacity:
-        style_parts.append(f'opacity:{p}_op')
-    elif initial_hidden:
-        # Use opacity:0 NOT display:none — display:none blocks descendant opacity animations
-        style_parts.append('opacity:0')
-    elif op_from != 1.0:
-        # Use animation's from-value, not initialState.opacity
-        # (initialState may be 0 for containers whose animation keeps them at 1 throughout)
-        style_parts.append(f'opacity:{_fmt(op_from)}')
-
     # Magic Move outer container: animate from prev-slide position to current (Slide5 destination).
     # Keynote stores outer containers at the DESTINATION position. The FROM position (where the
     # element was in the previous slide) is injected by transpile.py from the prev slide's JSON.
@@ -496,6 +477,25 @@ def _gen_layer(
             _emit_timed_interpolate(
                 lines, f'{p}_cty', dy, 0, mm_motion_timing, start_offset_frames, fps
             )
+
+    # Build CSS style
+    style_parts = [
+        f'position:"absolute"',
+        f'left:{_fmt(left)}',
+        f'top:{_fmt(top)}',
+        f'width:{_fmt(w)}',
+        f'height:{_fmt(h)}',
+    ]
+
+    if animated_opacity:
+        style_parts.append(f'opacity:{p}_op')
+    elif initial_hidden:
+        # Use opacity:0 NOT display:none — display:none blocks descendant opacity animations
+        style_parts.append('opacity:0')
+    elif op_from != 1.0:
+        # Use animation's from-value, not initialState.opacity
+        # (initialState may be 0 for containers whose animation keeps them at 1 throughout)
+        style_parts.append(f'opacity:{_fmt(op_from)}')
 
     transform_parts = []
     # Magic Move container translation (outer div moves from prev-slide pos to dest)
