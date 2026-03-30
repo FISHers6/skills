@@ -12,6 +12,7 @@ mapped to this unified progress variable.
 """
 
 from typing import Any
+import math
 
 FPS = 30
 HOLD_BEFORE = 1.0   # seconds of static hold before animation starts
@@ -40,6 +41,190 @@ def _layer_has_content(layer: dict) -> bool:
     if layer['anims']:
         return True
     return any(_layer_has_content(c) for c in layer['children'])
+
+
+def _layer_to_values(layer: dict) -> dict[str, Any]:
+    tx = ty = 0.0
+    sx = sy = 1.0
+    rz = 0.0
+    for anim in layer.get('anims', []):
+        if anim['property'] == 'transform.translation':
+            if anim.get('to_val'):
+                tx, ty = anim['to_val']
+        elif anim['property'] == 'transform.scale.xy' and anim.get('to_val') is not None:
+            sx = sy = anim['to_val']
+        elif anim['property'] == 'transform.scale.x' and anim.get('to_val') is not None:
+            sx = anim['to_val']
+        elif anim['property'] == 'transform.scale.y' and anim.get('to_val') is not None:
+            sy = anim['to_val']
+        elif anim['property'] == 'transform.rotation.z' and anim.get('to_val') is not None:
+            rz = anim['to_val']
+    return {'tx': tx, 'ty': ty, 'sx': sx, 'sy': sy, 'rz': rz}
+
+
+def _layer_from_values(layer: dict) -> dict[str, Any]:
+    tx = ty = 0.0
+    sx = sy = 1.0
+    rz = 0.0
+    for anim in layer.get('anims', []):
+        if anim['property'] == 'transform.translation':
+            if anim.get('from_val'):
+                tx, ty = anim['from_val']
+        elif anim['property'] == 'transform.scale.xy' and anim.get('from_val') is not None:
+            sx = sy = anim['from_val']
+        elif anim['property'] == 'transform.scale.x' and anim.get('from_val') is not None:
+            sx = anim['from_val']
+        elif anim['property'] == 'transform.scale.y' and anim.get('from_val') is not None:
+            sy = anim['from_val']
+        elif anim['property'] == 'transform.rotation.z' and anim.get('from_val') is not None:
+            rz = anim['from_val']
+    return {'tx': tx, 'ty': ty, 'sx': sx, 'sy': sy, 'rz': rz}
+
+
+def _transformed_leaf_box(layer: dict, parent_left: float, parent_top: float, values: dict[str, Any]) -> tuple[float, float, float, float]:
+    w = float(layer['width'])
+    h = float(layer['height'])
+    left = parent_left + float(layer['left'])
+    top = parent_top + float(layer['top'])
+    ax = float(layer['anchor_x']) * w
+    ay = float(layer['anchor_y']) * h
+
+    pts = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+    out = []
+    for px, py in pts:
+        px -= ax
+        py -= ay
+        px *= float(values['sx'])
+        py *= float(values['sy'])
+        rx = px * math.cos(float(values['rz'])) - py * math.sin(float(values['rz']))
+        ry = px * math.sin(float(values['rz'])) + py * math.cos(float(values['rz']))
+        rx += ax + float(values['tx']) + left
+        ry += ay + float(values['ty']) + top
+        out.append((rx, ry))
+    xs = [p[0] for p in out]
+    ys = [p[1] for p in out]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _subtree_box(layer: dict, mode: str, parent_left: float = 0.0, parent_top: float = 0.0) -> tuple[float, float, float, float] | None:
+    if mode == 'from' and layer.get('prev_slide_left') is not None and layer.get('prev_slide_top') is not None:
+        left = parent_left + float(layer['prev_slide_left'])
+        top = parent_top + float(layer['prev_slide_top'])
+    else:
+        left = parent_left + float(layer['left'])
+        top = parent_top + float(layer['top'])
+    if layer['children']:
+        boxes = []
+        for child in layer['children']:
+            box = _subtree_box(child, mode, left, top)
+            if box is not None:
+                boxes.append(box)
+        if not boxes:
+            return None
+        xs = [b[0] for b in boxes] + [b[2] for b in boxes]
+        ys = [b[1] for b in boxes] + [b[3] for b in boxes]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    values = _layer_from_values(layer) if mode == 'from' else _layer_to_values(layer)
+    return _transformed_leaf_box(layer, parent_left, parent_top, values)
+
+
+def _intersection_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    return w * h
+
+
+def _donor_source_for_highlight(children: list[dict], child_index: int) -> tuple[float, float] | None:
+    ring = children[child_index]
+    if not _is_opacity_only_subtree(ring):
+        return None
+
+    ring_final_box = (ring['left'], ring['top'], ring['left'] + ring['width'], ring['top'] + ring['height'])
+    best = None
+    best_score = 0.0
+
+    for idx, sibling in enumerate(children):
+        if idx == child_index or sibling.get('prev_slide_left') is None or sibling.get('prev_slide_top') is None:
+            continue
+        if not _subtree_has_transform_motion(sibling):
+            continue
+
+        donor_final_box = _subtree_box(sibling, 'to')
+        donor_source_box = _subtree_box(sibling, 'from')
+        if donor_final_box is None or donor_source_box is None:
+            continue
+
+        score = _intersection_area(ring_final_box, donor_final_box)
+        if score <= best_score:
+            continue
+        best_score = score
+        best = (donor_final_box, donor_source_box)
+
+    if best is None:
+        return None
+
+    donor_final_box, donor_source_box = best
+    final_w = max(1.0, donor_final_box[2] - donor_final_box[0])
+    final_h = max(1.0, donor_final_box[3] - donor_final_box[1])
+    ring_center_x = ring['left'] + ring['width'] / 2
+    ring_center_y = ring['top'] + ring['height'] / 2
+    rx = (ring_center_x - donor_final_box[0]) / final_w
+    ry = (ring_center_y - donor_final_box[1]) / final_h
+    source_w = donor_source_box[2] - donor_source_box[0]
+    source_h = donor_source_box[3] - donor_source_box[1]
+    source_center_x = donor_source_box[0] + rx * source_w
+    source_center_y = donor_source_box[1] + ry * source_h
+    return source_center_x - ring['width'] / 2, source_center_y - ring['height'] / 2
+
+
+def _subtree_properties(layer: dict) -> set[str]:
+    props = {anim['property'] for anim in layer.get('anims', [])}
+    for child in layer.get('children', []):
+        props.update(_subtree_properties(child))
+    return props
+
+
+def _subtree_has_transform_motion(layer: dict) -> bool:
+    motion_props = {
+        'transform.translation',
+        'transform.scale.x',
+        'transform.scale.y',
+        'transform.scale.xy',
+        'transform.rotation.z',
+    }
+    props = _subtree_properties(layer)
+    return any(prop in motion_props for prop in props)
+
+
+def _is_opacity_only_subtree(layer: dict) -> bool:
+    props = _subtree_properties(layer)
+    return props and props.issubset({'opacity', 'hidden'})
+
+
+def _is_opacity_only_magic_move(layer: dict) -> bool:
+    if layer.get('magic_move_from_left') is None or layer.get('magic_move_from_top') is None:
+        return False
+    return _is_opacity_only_subtree(layer)
+
+
+def _peer_motion_timing(children: list[dict], child_index: int) -> dict | None:
+    target = children[child_index]
+    if not _is_opacity_only_magic_move(target):
+        return None
+
+    candidates: list[dict] = []
+    for idx, sibling in enumerate(children):
+        if idx == child_index or not _subtree_has_transform_motion(sibling):
+            continue
+        window = _subtree_motion_timing(sibling)
+        if window is not None:
+            candidates.append(window)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda window: (window['end_time'] - window['begin_time'], window['end_time']))
 
 
 def _timing_to_frames(anim: dict | None, start_offset_frames: int, fps: int) -> tuple[int, int, str]:
@@ -138,6 +323,7 @@ def _gen_layer(
     start_offset_frames: int,
     segment_duration_sec: float,
     fps: int,
+    borrowed_motion_timing: dict | None = None,
 ):
     """
     Recursively generate animation variables and JSX for one layer.
@@ -256,8 +442,11 @@ def _gen_layer(
             _emit_timed_interpolate(lines, f'{p}_rz', rz_from, rz_to, rz_anim, start_offset_frames, fps)
 
     if animated_opacity:
+        opacity_timing = opacity_anim or hidden_anim
+        if borrowed_motion_timing is not None and _is_opacity_only_subtree(layer):
+            opacity_timing = borrowed_motion_timing
         _emit_timed_interpolate(
-            lines, f'{p}_op', op_from, op_to, opacity_anim or hidden_anim, start_offset_frames, fps
+            lines, f'{p}_op', op_from, op_to, opacity_timing, start_offset_frames, fps
         )
 
     if animated_contents:
@@ -294,7 +483,7 @@ def _gen_layer(
         dx = mm_from_left - left   # positive = element starts to the right of dest
         dy = mm_from_top  - top    # positive = element starts below dest
         if abs(dx) > 0.5 or abs(dy) > 0.5:
-            mm_motion_timing = _subtree_motion_timing(layer)
+            mm_motion_timing = borrowed_motion_timing or _subtree_motion_timing(layer)
             if mm_motion_timing is None:
                 mm_motion_timing = {
                     'begin_time': 0.0,
@@ -355,7 +544,20 @@ def _gen_layer(
             png = tex_map[texture_id]
             jsx_lines.append(f'        <Img src={{staticFile("{png}")}} style={{{{width:"100%",height:"100%"}}}} />')
     else:
+        child_borrowed_windows = [_peer_motion_timing(children, i) for i in range(len(children))]
+        child_source_overrides = [_donor_source_for_highlight(children, i) for i in range(len(children))]
+        if borrowed_motion_timing is not None and _is_opacity_only_subtree(layer):
+            child_borrowed_windows = [
+                borrowed_motion_timing if not _subtree_has_transform_motion(child) else child_borrowed_windows[i]
+                for i, child in enumerate(children)
+            ]
         for i, child in enumerate(children):
+            if child_source_overrides[i] is not None:
+                child = {
+                    **child,
+                    'magic_move_from_left': child_source_overrides[i][0],
+                    'magic_move_from_top': child_source_overrides[i][1],
+                }
             _gen_layer(
                 child,
                 tex_map,
@@ -366,6 +568,7 @@ def _gen_layer(
                 start_offset_frames,
                 segment_duration_sec,
                 fps,
+                child_borrowed_windows[i],
             )
 
     jsx_lines.append('      </div>')

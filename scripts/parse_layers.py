@@ -27,6 +27,7 @@ Layer dict schema:
       timing         - 'EaseInEaseOut' | 'Linear' | 'EaseIn' | 'EaseOut'
       begin_time     - float seconds
       duration       - float seconds
+  prev_slide_left, prev_slide_top - inferred previous-slide top-left for this layer when available
 """
 
 SKIP_PROPERTIES = {'position'}          # position is handled as a layout value, not an animation
@@ -165,6 +166,8 @@ def parse_layer(layer: dict) -> dict:
         'children': children,
         'magic_move_from_left': layer.get('magic_move_from_left'),
         'magic_move_from_top': layer.get('magic_move_from_top'),
+        'prev_slide_left': layer.get('prev_slide_left'),
+        'prev_slide_top': layer.get('prev_slide_top'),
     }
 
 
@@ -233,4 +236,3 @@ def get_prev_slide_positions(slide_json: dict, canvas_width: int = 1920, canvas_
             result.append((cx - ax * gw, cy - ay * gh))
 
     return result
-

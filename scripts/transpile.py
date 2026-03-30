@@ -141,6 +141,68 @@ def _descendant_textures(layer: dict) -> list[str]:
     return textures
 
 
+def _apply_final_contents(layer: dict) -> dict:
+    updated = copy.deepcopy(layer)
+    final_texture = None
+    for anim in updated.get('animations', []):
+        if anim.get('property') == 'contents':
+            final_texture = anim.get('to', {}).get('texture') or final_texture
+        for sub in anim.get('animations', []):
+            if sub.get('property') == 'contents':
+                final_texture = sub.get('to', {}).get('texture') or final_texture
+    if final_texture:
+        updated['texture'] = final_texture
+    updated['layers'] = [_apply_final_contents(child) for child in updated.get('layers', [])]
+    return updated
+
+
+def _get_slide_final_base_layer(slide_json: dict) -> dict:
+    events = slide_json.get('events', [])
+    if not events:
+        return {}
+    event = events[-1]
+    effects = event.get('effects', [])
+    effect = effects[0] if effects else {}
+    if effect and effect.get('baseLayer'):
+        merged = merge_effect_base_layer(event['baseLayer'], effect['baseLayer'])
+    else:
+        merged = copy.deepcopy(event.get('baseLayer', {}))
+    return _apply_final_contents(merged)
+
+
+def _get_positions_from_base_layer(base_layer: dict, canvas_width: int = 1920, canvas_height: int = 1080) -> list:
+    result = []
+    for group in base_layer.get('layers', []):
+        s = group.get('initialState', {})
+        gw = float(s.get('width', 0))
+        gh = float(s.get('height', 0))
+        if abs(gw - canvas_width) < 2 and abs(gh - canvas_height) < 2:
+            found = None
+            for sub in group.get('layers', []):
+                ss = sub.get('initialState', {})
+                sw = float(ss.get('width', 0))
+                sh = float(ss.get('height', 0))
+                if not (abs(sw - canvas_width) < 2 and abs(sh - canvas_height) < 2):
+                    ap = ss.get('anchorPoint', {'pointX': 0.5, 'pointY': 0.5})
+                    pos = ss.get('position', {})
+                    cx = float(pos.get('pointX', 0))
+                    cy = float(pos.get('pointY', 0))
+                    ax = float(ap.get('pointX', 0.5))
+                    ay = float(ap.get('pointY', 0.5))
+                    found = (cx - ax * sw, cy - ay * sh)
+                    break
+            result.append(found)
+        else:
+            ap = s.get('anchorPoint', {'pointX': 0.5, 'pointY': 0.5})
+            pos = s.get('position', {})
+            cx = float(pos.get('pointX', 0))
+            cy = float(pos.get('pointY', 0))
+            ax = float(ap.get('pointX', 0.5))
+            ay = float(ap.get('pointY', 0.5))
+            result.append((cx - ax * gw, cy - ay * gh))
+    return result
+
+
 def _contents_pairs(layer: dict) -> list[tuple[str | None, str | None]]:
     pairs: list[tuple[str | None, str | None]] = []
     for anim in layer.get('animations', []):
@@ -201,13 +263,13 @@ def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) 
     if not prev_slide_json:
         return base_layer
 
-    prev_event_base = prev_slide_json.get('events', [{}])[0].get('baseLayer', {})
+    prev_event_base = _get_slide_final_base_layer(prev_slide_json)
     prev_children = prev_event_base.get('layers', [])
     curr_children = base_layer.get('layers', [])
     if not prev_children or not curr_children:
         return base_layer
 
-    prev_positions = get_prev_slide_positions(prev_slide_json)
+    prev_positions = _get_positions_from_base_layer(prev_event_base)
     prev_by_texture: dict[str, list[tuple[int, tuple[float, float] | None]]] = {}
     for idx, child in enumerate(prev_children):
         textures = _descendant_textures(child)
@@ -216,10 +278,9 @@ def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) 
 
     current_from_occurrence: dict[str, int] = {}
     matched_positions: dict[int, tuple[float, float]] = {}
+    donor_positions: dict[int, tuple[float, float]] = {}
 
     for idx, child in enumerate(curr_children):
-        if _has_intrinsic_motion(child):
-            continue
         pairs = [pair for pair in _contents_pairs(child) if pair[0]]
         if not pairs:
             continue
@@ -238,7 +299,14 @@ def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) 
         prev_pos = candidates[occurrence][1]
         if prev_pos is None:
             continue
-        matched_positions[idx] = prev_pos
+        donor_positions[idx] = prev_pos
+        if not _has_intrinsic_motion(child):
+            matched_positions[idx] = prev_pos
+
+    merged = copy.deepcopy(base_layer)
+    for idx, prev_pos in donor_positions.items():
+        merged['layers'][idx]['prev_slide_left'] = prev_pos[0]
+        merged['layers'][idx]['prev_slide_top'] = prev_pos[1]
 
     if not matched_positions:
         # Conservative fallback for simple "previous slide was just full-canvas wrappers" cases.
@@ -247,7 +315,6 @@ def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) 
             len(curr_children) <= 6 and
             all(_is_canvas_sized(child) for child in prev_children)
         ):
-            merged = copy.deepcopy(base_layer)
             for child, prev_pos in zip(merged.get('layers', []), prev_positions):
                 if _has_intrinsic_motion(child):
                     continue
@@ -256,9 +323,7 @@ def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) 
                 child['magic_move_from_left'] = prev_pos[0]
                 child['magic_move_from_top'] = prev_pos[1]
             return merged
-        return base_layer
-
-    merged = copy.deepcopy(base_layer)
+        return merged
     for idx, prev_pos in matched_positions.items():
         merged['layers'][idx]['magic_move_from_left'] = prev_pos[0]
         merged['layers'][idx]['magic_move_from_top'] = prev_pos[1]
