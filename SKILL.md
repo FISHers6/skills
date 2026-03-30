@@ -119,12 +119,15 @@ and rasterizes each page as PNG to `remotion/public/textures/s{N:03d}_{idx}.png`
 
 ### Step 3: Generate TSX
 
-`generate_tsx.py` collapses all animations to a single `progress` variable (0→1).
+`generate_tsx.py` preserves each property's own `beginTime` / `duration` when emitting
+`interpolate(frame, ...)` variables. A slide-level `progress` is still useful for outer
+Magic Move container travel, but per-property fades, contents swaps, scales, rotations,
+and translations must keep their original timing windows.
 
 Generated per-slide pattern:
 ```tsx
 const progress = interpolate(frame, [START, END], [0, 1], { ...CLAMP, easing: ... });
-const L_tx = interpolate(progress, [0,1], [from, to], CLAMP);
+const L_tx = interpolate(frame, [30, 45], [from, to], { ...CLAMP, easing: ... });
 // ...
 <div style={{position:"absolute", left:X, top:Y, width:W, height:H,
              transform:`translate(${L_tx}px,${L_ty}px)`,
@@ -135,7 +138,7 @@ const L_tx = interpolate(progress, [0,1], [from, to], CLAMP);
 
 For contents (texture cross-dissolve):
 ```tsx
-const L_cop = interpolate(progress, [0,1], [1,0], CLAMP);
+const L_cop = interpolate(frame, [35, 45], [1,0], { ...CLAMP, easing: ... });
 <Img src={staticFile("textures/from.png")} style={{opacity:L_cop}} />
 <Img src={staticFile("textures/to.png")}   style={{opacity:1-L_cop}} />
 ```
@@ -165,6 +168,8 @@ Registers all slide compositions with correct `durationInFrames`. Generated auto
 | Tail/head highlight ring never appears on some transition pages even though the texture exists | Keynote sometimes encodes `hidden` animation booleans inside the `scalar` field (`{'scalar': True}` / `False`). If `parse_layers.py` coerces that to `1.0/0.0`, `generate_tsx.py` later interprets `bool(1.0)` as already-hidden at frame 0 and forces `opacity:0` for the whole layer. | In `_parse_value()`, detect boolean-valued `scalar` before float conversion and return a real `bool`. This preserves `hidden=False→True` timing so transient rings stay visible at the start of the transition. |
 | A transient ring/label appears to be missing, but its texture exists in the slide | The generator treats any `hidden=True` animation as if it applied from frame 0, ignoring `beginTime`. In Keynote, many layers stay visible briefly and only switch to hidden later in the transition. | In `generate_tsx.py`, only let `hidden.from_val` override the initial visibility when `beginTime == 0`. Delayed hidden animations should affect the end state, not the initial state. |
 | Magic Move: elements don't enter/exit canvas (stay at Slide5 position throughout) | Keynote stores outer containers at the DESTINATION (Slide5) position in the effect's baseLayer. The FROM position (Slide4) is NOT encoded — only the inner element's scroll offset is stored. For elements entering from below canvas, the transpiler must read the previous slide's JSON to get the Slide4 outer-container position, then animate the outer container from Slide4 → Slide5. | In `transpile.py`, load prev slide's JSON for magic-move slides. Call `get_prev_slide_positions(prev_json)` from `parse_layers.py` to extract non-canvas-wrapper element positions. Inject as `magic_move_from_left`/`from_top` on each root child. In `generate_tsx.py`, generate `{p}_ctx`/`{p}_cty` vars and add outer-container translate animation. |
+| A transition feels like the next state arrives before the current one finishes | The generator mapped delayed `contents` / `opacity` / `scale` / `translation` / `rotation` animations to one slide-wide `progress`, so late sub-animations started too early and overlapped incorrectly. | Emit each property's `interpolate(frame, ...)` with its own `beginTime` / `duration`. Keep slide-level `progress` only for outer Magic Move container travel. |
+| A page loses a smooth move that exists in Keynote, especially when the page has both a build-in and a later transition | The slide JSON can contain multiple sequential `events`, but `transpile.py` only consumed `events[0].effects[0]`. On pages like `apple:twist-and-scale` followed by `apple:magic-move-implied-motion-path`, the later transition was dropped entirely, so the generated TSX only showed the early build-in snapshot. | Transpile every event in order into per-slide segments. Offset each segment's animations by the cumulative duration of earlier events, and render only the active segment's layer tree for that time window. |
 
 ## Animation Properties
 
@@ -183,7 +188,7 @@ CAAnimationGroup nesting: animations can live in `layer.animations[0].animations
 
 Generated TSX files are standard Remotion compositions. Combine with:
 - `spring()` for physics-based animations on top of transpiled animations
-- `<Sequence>` for staggered per-element timings (current transpiler collapses all to one `progress`)
+- `<Sequence>` for extra staggered timing on top of the preserved Keynote timings
 - `<Audio>` for voiceover
 - Custom Remotion components replacing specific slides entirely
 

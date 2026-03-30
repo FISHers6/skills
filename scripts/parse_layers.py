@@ -163,6 +163,8 @@ def parse_layer(layer: dict) -> dict:
         'texture_id': texture_id,
         'anims': anims,
         'children': children,
+        'magic_move_from_left': layer.get('magic_move_from_left'),
+        'magic_move_from_top': layer.get('magic_move_from_top'),
     }
 
 
@@ -231,3 +233,4 @@ def get_prev_slide_positions(slide_json: dict, canvas_width: int = 1920, canvas_
             result.append((cx - ax * gw, cy - ay * gh))
 
     return result
+

@@ -42,7 +42,103 @@ def _layer_has_content(layer: dict) -> bool:
     return any(_layer_has_content(c) for c in layer['children'])
 
 
-def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, lines: list, jsx_lines: list):
+def _timing_to_frames(anim: dict | None, start_offset_frames: int, fps: int) -> tuple[int, int, str]:
+    """
+    Convert a Keynote animation's begin/duration into absolute composition frames.
+
+    Per-property beginTime/duration matter. Collapsing everything to the slide-level
+    `progress` makes later cross-dissolves and delayed fades start too early, which is
+    exactly what causes "the next frame arrives before the current animation is done".
+    """
+    if anim is None:
+        start_frame = start_offset_frames
+        end_frame = start_offset_frames + max(1, round(0.001 * fps))
+        return start_frame, end_frame, 'Easing.inOut(Easing.ease)'
+
+    start_frame = start_offset_frames + round(float(anim.get('begin_time', 0.0)) * fps)
+    end_frame = start_frame + max(1, round(float(anim.get('duration', 0.0)) * fps))
+    timing = TIMING_MAP.get(anim.get('timing', 'EaseInEaseOut'), 'Easing.inOut(Easing.ease)')
+    return start_frame, end_frame, timing
+
+
+def _emit_timed_interpolate(
+    lines: list[str],
+    var_name: str,
+    from_val: Any,
+    to_val: Any,
+    anim: dict | None,
+    start_offset_frames: int,
+    fps: int,
+):
+    start_frame, end_frame, timing = _timing_to_frames(anim, start_offset_frames, fps)
+    options = ['...CLAMP']
+    if timing != 'undefined':
+        options.append(f'easing: {timing}')
+    options_str = ', '.join(options)
+    lines.append(
+        f'  const {var_name} = interpolate(frame, [{start_frame},{end_frame}], '
+        f'[{_fmt(from_val)},{_fmt(to_val)}], {{ {options_str} }});'
+    )
+
+
+def _subtree_motion_timing(layer: dict) -> dict | None:
+    """
+    Find the visible animation window for a layer subtree.
+
+    Magic Move wrapper travel should line up with when that specific element is
+    actually animating on screen. Using the whole slide progress makes transient
+    highlight rings fade out before they ever reach the destination.
+
+    Hidden animations are excluded because they usually just keep the layer
+    hidden after the real motion/fade has already finished.
+    """
+    earliest = None
+    latest = None
+    timing = 'EaseInEaseOut'
+
+    for anim in layer.get('anims', []):
+        if anim['property'] == 'hidden':
+            continue
+        begin = float(anim.get('begin_time', 0.0))
+        end = begin + float(anim.get('duration', 0.0))
+        if earliest is None or begin < earliest:
+            earliest = begin
+            timing = anim.get('timing', 'EaseInEaseOut')
+        if latest is None or end > latest:
+            latest = end
+
+    for child in layer.get('children', []):
+        child_window = _subtree_motion_timing(child)
+        if child_window is None:
+            continue
+        if earliest is None or child_window['begin_time'] < earliest:
+            earliest = child_window['begin_time']
+            timing = child_window.get('timing', 'EaseInEaseOut')
+        if latest is None or child_window['end_time'] > latest:
+            latest = child_window['end_time']
+
+    if earliest is None or latest is None:
+        return None
+
+    return {
+        'begin_time': earliest,
+        'duration': max(0.001, latest - earliest),
+        'timing': timing,
+        'end_time': latest,
+    }
+
+
+def _gen_layer(
+    layer: dict,
+    tex_map: dict,
+    slide_num: int,
+    var_prefix: str,
+    lines: list,
+    jsx_lines: list,
+    start_offset_frames: int,
+    segment_duration_sec: float,
+    fps: int,
+):
     """
     Recursively generate animation variables and JSX for one layer.
     Only emits code for layers with textures, animations, or content children.
@@ -60,6 +156,7 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     texture_id = layer['texture_id']
     anims = layer['anims']
     children = layer['children']
+    prop_anims = {anim['property']: anim for anim in anims}
 
     is_leaf = texture_id is not None
     has_anims = bool(anims)
@@ -79,6 +176,7 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     #   hidden False→False + opacity 0→1 → fades in normally (Slide006 green bar)
     hidden_from = initial_hidden
     hidden_to = initial_hidden
+    hidden_anim = prop_anims.get('hidden')
     for anim in anims:
         if anim['property'] == 'hidden':
             # Respect delayed hidden animations. A hidden=True animation that starts
@@ -99,6 +197,12 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     op_to   = 0.0 if hidden_to   else initial_opacity
     contents_from = texture_id
     contents_to = texture_id
+    translation_anim = prop_anims.get('transform.translation')
+    sx_anim = prop_anims.get('transform.scale.xy') or prop_anims.get('transform.scale.x')
+    sy_anim = prop_anims.get('transform.scale.xy') or prop_anims.get('transform.scale.y')
+    rz_anim = prop_anims.get('transform.rotation.z')
+    opacity_anim = prop_anims.get('opacity')
+    contents_anim = prop_anims.get('contents')
 
     for anim in anims:
         prop = anim['property']
@@ -142,20 +246,23 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
 
     # Emit animation variable declarations
     if animated_transform:
-        lines.append(f'  const {p}_tx = interpolate(progress, [0,1], [{_fmt(tx_from)},{_fmt(tx_to)}], CLAMP);')
-        lines.append(f'  const {p}_ty = interpolate(progress, [0,1], [{_fmt(ty_from)},{_fmt(ty_to)}], CLAMP);')
+        _emit_timed_interpolate(lines, f'{p}_tx', tx_from, tx_to, translation_anim, start_offset_frames, fps)
+        _emit_timed_interpolate(lines, f'{p}_ty', ty_from, ty_to, translation_anim, start_offset_frames, fps)
         if sx_from != sx_to:
-            lines.append(f'  const {p}_sx = interpolate(progress, [0,1], [{_fmt(sx_from)},{_fmt(sx_to)}], CLAMP);')
+            _emit_timed_interpolate(lines, f'{p}_sx', sx_from, sx_to, sx_anim, start_offset_frames, fps)
         if sy_from != sy_to:
-            lines.append(f'  const {p}_sy = interpolate(progress, [0,1], [{_fmt(sy_from)},{_fmt(sy_to)}], CLAMP);')
+            _emit_timed_interpolate(lines, f'{p}_sy', sy_from, sy_to, sy_anim, start_offset_frames, fps)
         if rz_from != rz_to:
-            lines.append(f'  const {p}_rz = interpolate(progress, [0,1], [{_fmt(rz_from)},{_fmt(rz_to)}], CLAMP);')
+            _emit_timed_interpolate(lines, f'{p}_rz', rz_from, rz_to, rz_anim, start_offset_frames, fps)
 
     if animated_opacity:
-        lines.append(f'  const {p}_op = interpolate(progress, [0,1], [{_fmt(op_from)},{_fmt(op_to)}], CLAMP);')
+        _emit_timed_interpolate(
+            lines, f'{p}_op', op_from, op_to, opacity_anim or hidden_anim, start_offset_frames, fps
+        )
 
     if animated_contents:
-        lines.append(f'  const {p}_cop = interpolate(progress, [0,1], [1,0], CLAMP); // contents A → B')
+        _emit_timed_interpolate(lines, f'{p}_cop', 1, 0, contents_anim, start_offset_frames, fps)
+        lines[-1] += ' // contents A → B'
 
     # Build CSS style
     style_parts = [
@@ -182,12 +289,24 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     # This creates the "enter from below canvas" / "exit canvas" visual motion.
     mm_from_left = layer.get('magic_move_from_left')
     mm_from_top  = layer.get('magic_move_from_top')
+    mm_motion_timing = None
     if mm_from_left is not None and mm_from_top is not None:
         dx = mm_from_left - left   # positive = element starts to the right of dest
         dy = mm_from_top  - top    # positive = element starts below dest
         if abs(dx) > 0.5 or abs(dy) > 0.5:
-            lines.append(f'  const {p}_ctx = interpolate(progress, [0,1], [{_fmt(dx)},0], CLAMP);')
-            lines.append(f'  const {p}_cty = interpolate(progress, [0,1], [{_fmt(dy)},0], CLAMP);')
+            mm_motion_timing = _subtree_motion_timing(layer)
+            if mm_motion_timing is None:
+                mm_motion_timing = {
+                    'begin_time': 0.0,
+                    'duration': max(0.001, segment_duration_sec),
+                    'timing': 'EaseInEaseOut',
+                }
+            _emit_timed_interpolate(
+                lines, f'{p}_ctx', dx, 0, mm_motion_timing, start_offset_frames, fps
+            )
+            _emit_timed_interpolate(
+                lines, f'{p}_cty', dy, 0, mm_motion_timing, start_offset_frames, fps
+            )
 
     transform_parts = []
     # Magic Move container translation (outer div moves from prev-slide pos to dest)
@@ -237,7 +356,17 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
             jsx_lines.append(f'        <Img src={{staticFile("{png}")}} style={{{{width:"100%",height:"100%"}}}} />')
     else:
         for i, child in enumerate(children):
-            _gen_layer(child, tex_map, slide_num, f'{p}c{i}', lines, jsx_lines)
+            _gen_layer(
+                child,
+                tex_map,
+                slide_num,
+                f'{p}c{i}',
+                lines,
+                jsx_lines,
+                start_offset_frames,
+                segment_duration_sec,
+                fps,
+            )
 
     jsx_lines.append('      </div>')
 
@@ -245,9 +374,7 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
 def generate_slide_tsx(
     slide_num: int,
     slide_name: str,
-    effect_name: str,
-    duration_sec: float,
-    root_layer: dict,
+    segments: list[dict],
     tex_map: dict,
     fps: int = FPS,
 ) -> str:
@@ -255,20 +382,56 @@ def generate_slide_tsx(
     frames_const = f'SLIDE_{slide_num:03d}_FRAMES'
 
     hold_before_frames = round(HOLD_BEFORE * fps)
-    anim_frames = max(1, round(duration_sec * fps))
+    anim_frames = sum(max(1, round(float(segment['duration_sec']) * fps)) for segment in segments)
     hold_after_frames = round(HOLD_AFTER * fps)
     total_frames = hold_before_frames + anim_frames + hold_after_frames
 
     var_lines: list = []
-    jsx_lines: list = []
+    segment_blocks: list[str] = []
+    segment_start_frames: list[int] = []
+    running_frames = hold_before_frames
 
-    # Emit root_layer itself — preserves its canvas-space offset.
-    # CRITICAL: do NOT skip root and iterate its children directly.
-    # For slides where root is offset (e.g. character animations with root at 237,347),
-    # skipping root would place all children at canvas (0,0) instead of their correct position.
-    _gen_layer(root_layer, tex_map, slide_num, 'L', var_lines, jsx_lines)
+    for idx, segment in enumerate(segments):
+        segment_start = running_frames
+        segment_start_frames.append(segment_start)
+        segment_frames = max(1, round(float(segment['duration_sec']) * fps))
+        segment_jsx_lines: list[str] = []
 
-    jsx_body = '\n'.join(jsx_lines) if jsx_lines else '      {/* no animated layers */}'
+        # Emit root_layer itself — preserves its canvas-space offset.
+        _gen_layer(
+            segment['root_layer'],
+            tex_map,
+            slide_num,
+            f'L{idx}',
+            var_lines,
+            segment_jsx_lines,
+            segment_start,
+            float(segment['duration_sec']),
+            fps,
+        )
+
+        segment_body = '\n'.join(segment_jsx_lines) if segment_jsx_lines else '        {/* no animated layers */}'
+        next_start = segment_start + segment_frames
+        if idx == 0 and len(segments) == 1:
+            segment_blocks.append(segment_body)
+        elif idx == 0:
+            segment_blocks.append(
+                f'      {{frame < {next_start} ? (\n{segment_body}\n      ) : null}}'
+            )
+        elif idx == len(segments) - 1:
+            segment_blocks.append(
+                f'      {{frame >= {segment_start} ? (\n{segment_body}\n      ) : null}}'
+            )
+        else:
+            segment_blocks.append(
+                f'      {{frame >= {segment_start} && frame < {next_start} ? (\n{segment_body}\n      ) : null}}'
+            )
+
+        running_frames += segment_frames
+
+    jsx_body = '\n'.join(segment_blocks) if segment_blocks else '      {/* no animated layers */}'
+    effect_name = ' + '.join(segment['effect_name'] for segment in segments)
+    duration_sec = sum(float(segment['duration_sec']) for segment in segments)
 
     tsx = f'''\
 import React from "react";
@@ -279,15 +442,7 @@ import {{ AbsoluteFill, Easing, Img, interpolate, staticFile, useCurrentFrame, u
 export const {comp_name}: React.FC = () => {{
   const frame = useCurrentFrame();
   const {{ fps }} = useVideoConfig();
-
-  const START = Math.round({HOLD_BEFORE} * fps);
-  const END = START + Math.max(1, Math.round({duration_sec:.6g} * fps));
   const CLAMP = {{ extrapolateLeft: "clamp" as const, extrapolateRight: "clamp" as const }};
-
-  const progress = interpolate(frame, [START, END], [0, 1], {{
-    ...CLAMP,
-    easing: Easing.inOut(Easing.ease),
-  }});
 
 {chr(10).join(var_lines) if var_lines else "  // static slide — no animations"}
 

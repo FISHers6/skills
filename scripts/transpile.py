@@ -40,7 +40,7 @@ from pathlib import Path
 script_dir = Path(__file__).parent.resolve()
 sys.path.insert(0, str(script_dir))
 
-from parse_layers import parse_layer
+from parse_layers import get_prev_slide_positions, parse_layer
 from generate_tsx import generate_slide_tsx, HOLD_BEFORE, HOLD_AFTER
 
 
@@ -124,6 +124,147 @@ def merge_effect_base_layer(event_base: dict, effect_base: dict) -> dict:
     return full_scene
 
 
+def _is_canvas_sized(layer: dict, canvas_width: int = 1920, canvas_height: int = 1080) -> bool:
+    state = layer.get('initialState', {})
+    width = float(state.get('width', 0))
+    height = float(state.get('height', 0))
+    return abs(width - canvas_width) < 2 and abs(height - canvas_height) < 2
+
+
+def _descendant_textures(layer: dict) -> list[str]:
+    textures: list[str] = []
+    texture = layer.get('texture')
+    if isinstance(texture, str):
+        textures.append(texture)
+    for child in layer.get('layers', []):
+        textures.extend(_descendant_textures(child))
+    return textures
+
+
+def _contents_pairs(layer: dict) -> list[tuple[str | None, str | None]]:
+    pairs: list[tuple[str | None, str | None]] = []
+    for anim in layer.get('animations', []):
+        if anim.get('property') == 'contents':
+            frm = anim.get('from', {}).get('texture')
+            to = anim.get('to', {}).get('texture')
+            pairs.append((frm, to))
+        for sub in anim.get('animations', []):
+            if sub.get('property') == 'contents':
+                frm = sub.get('from', {}).get('texture')
+                to = sub.get('to', {}).get('texture')
+                pairs.append((frm, to))
+    for child in layer.get('layers', []):
+        pairs.extend(_contents_pairs(child))
+    return pairs
+
+
+def _has_intrinsic_motion(layer: dict) -> bool:
+    """
+    True when the subtree already carries its own transform motion.
+
+    Adding an extra outer-container translate on top of an existing per-layer
+    translate / scale / rotation double-counts the movement and makes objects
+    disappear before snapping back in. We only inject magic-move container motion
+    for highlight-like layers that otherwise just cross-dissolve or fade.
+    """
+    motion_props = {
+        'transform.translation',
+        'transform.scale.x',
+        'transform.scale.y',
+        'transform.scale.xy',
+        'transform.rotation.z',
+    }
+    for anim in layer.get('animations', []):
+        if anim.get('property') in motion_props:
+            return True
+        for sub in anim.get('animations', []):
+            if sub.get('property') in motion_props:
+                return True
+    return any(_has_intrinsic_motion(child) for child in layer.get('layers', []))
+
+
+def inject_magic_move_positions(base_layer: dict, prev_slide_json: dict | None) -> dict:
+    """
+    Attach previous-slide positions only to high-confidence matching top-level children.
+
+    Strategy:
+    1. Prefer object-level matching by `contents.from` texture → previous slide top-level leaf texture.
+       This works for slides where Keynote already split the scene into per-object layers.
+       Do NOT skip layers just because their descendants also animate. In many Magic Move slides,
+       the outer container still needs the previous slide's position while the inner leaf handles
+       scale/contents/rotation. Skipping those layers is what makes the highlight ring move while
+       the spoon/chopsticks beneath it jump to the destination frame.
+    2. If no texture-based matches exist at all, fall back to top-level order only for small,
+       full-canvas wrapper slides. This preserves simple cases without damaging dense magic-move
+       grids where counts diverge.
+    """
+    if not prev_slide_json:
+        return base_layer
+
+    prev_event_base = prev_slide_json.get('events', [{}])[0].get('baseLayer', {})
+    prev_children = prev_event_base.get('layers', [])
+    curr_children = base_layer.get('layers', [])
+    if not prev_children or not curr_children:
+        return base_layer
+
+    prev_positions = get_prev_slide_positions(prev_slide_json)
+    prev_by_texture: dict[str, list[tuple[int, tuple[float, float] | None]]] = {}
+    for idx, child in enumerate(prev_children):
+        textures = _descendant_textures(child)
+        if len(textures) == 1:
+            prev_by_texture.setdefault(textures[0], []).append((idx, prev_positions[idx]))
+
+    current_from_occurrence: dict[str, int] = {}
+    matched_positions: dict[int, tuple[float, float]] = {}
+
+    for idx, child in enumerate(curr_children):
+        if _has_intrinsic_motion(child):
+            continue
+        pairs = [pair for pair in _contents_pairs(child) if pair[0]]
+        if not pairs:
+            continue
+
+        from_texture = pairs[0][0]
+        if not isinstance(from_texture, str):
+            continue
+
+        occurrence = current_from_occurrence.get(from_texture, 0)
+        current_from_occurrence[from_texture] = occurrence + 1
+
+        candidates = prev_by_texture.get(from_texture, [])
+        if occurrence >= len(candidates):
+            continue
+
+        prev_pos = candidates[occurrence][1]
+        if prev_pos is None:
+            continue
+        matched_positions[idx] = prev_pos
+
+    if not matched_positions:
+        # Conservative fallback for simple "previous slide was just full-canvas wrappers" cases.
+        if (
+            len(prev_positions) == len(curr_children) and
+            len(curr_children) <= 6 and
+            all(_is_canvas_sized(child) for child in prev_children)
+        ):
+            merged = copy.deepcopy(base_layer)
+            for child, prev_pos in zip(merged.get('layers', []), prev_positions):
+                if _has_intrinsic_motion(child):
+                    continue
+                if prev_pos is None:
+                    continue
+                child['magic_move_from_left'] = prev_pos[0]
+                child['magic_move_from_top'] = prev_pos[1]
+            return merged
+        return base_layer
+
+    merged = copy.deepcopy(base_layer)
+    for idx, prev_pos in matched_positions.items():
+        merged['layers'][idx]['magic_move_from_left'] = prev_pos[0]
+        merged['layers'][idx]['magic_move_from_top'] = prev_pos[1]
+    return merged
+
+
 def generate_root_tsx(registry: list, src_dir: Path, fps: int = 30, width: int = 1920, height: int = 1080):
     """Generate Root.tsx that registers all slide compositions."""
     imports = []
@@ -150,6 +291,39 @@ def generate_root_tsx(registry: list, src_dir: Path, fps: int = 30, width: int =
     print(f"Generated Root.tsx with {len(registry)} compositions → {out}")
 
 
+def _load_prev_slide_data(base: Path, slide_num: int) -> dict | None:
+    if slide_num <= 1:
+        return None
+    header = json.loads((base / 'assets' / 'header.json').read_text())
+    prev_slide_id = header['slideList'][slide_num - 2]
+    prev_json_path = base / 'assets' / prev_slide_id / f'{prev_slide_id}.json'
+    if not prev_json_path.exists():
+        return None
+    with open(prev_json_path) as f:
+        return json.load(f)
+
+
+def _build_segment(event: dict, prev_data: dict | None) -> dict:
+    effects = event.get('effects', [])
+    effect = effects[0] if effects else {}
+    effect_name = effect.get('name', 'none')
+    duration_sec = float(effect.get('duration', 0.001))
+
+    if effect and effect.get('baseLayer'):
+        merged_base = merge_effect_base_layer(event['baseLayer'], effect['baseLayer'])
+        if 'magic-move' in effect_name.lower():
+            merged_base = inject_magic_move_positions(merged_base, prev_data)
+        root_layer = parse_layer(merged_base)
+    else:
+        root_layer = parse_layer(event['baseLayer'])
+
+    return {
+        'effect_name': effect_name,
+        'duration_sec': duration_sec,
+        'root_layer': root_layer,
+    }
+
+
 def transpile_slide(slide_num: int, slide_id: str, base: Path, all_tex: dict, fps: int = 30) -> dict | None:
     slide_dir = base / 'assets' / slide_id
     json_path = slide_dir / f'{slide_id}.json'
@@ -160,31 +334,25 @@ def transpile_slide(slide_num: int, slide_id: str, base: Path, all_tex: dict, fp
         data = json.load(f)
 
     tex_map = all_tex.get(slide_id, {})
-    event = data['events'][0]
-    effects = event.get('effects', [])
-    effect = effects[0] if effects else {}
-
-    effect_name = effect.get('name', 'none')
-    duration_sec = float(effect.get('duration', 0.001))
     slide_desc = get_slide_description(data)
+    prev_data = _load_prev_slide_data(base, slide_num)
+    segments = [_build_segment(event, prev_data) for event in data.get('events', [])]
+    if not segments:
+        segments = [{
+            'effect_name': 'none',
+            'duration_sec': 0.001,
+            'root_layer': parse_layer({}),
+        }]
 
-    if effect and effect.get('baseLayer'):
-        merged_base = merge_effect_base_layer(event['baseLayer'], effect['baseLayer'])
-        root_layer = parse_layer(merged_base)
-    else:
-        # Static slides still store their full visual tree in event.baseLayer.
-        # Falling back to an empty root turns them into blank white pages.
-        root_layer = parse_layer(event['baseLayer'])
-
-    anim_frames = max(1, round(duration_sec * fps))
+    duration_sec = sum(float(segment['duration_sec']) for segment in segments)
+    effect_name = ' + '.join(segment['effect_name'] for segment in segments)
+    anim_frames = sum(max(1, round(float(segment['duration_sec']) * fps)) for segment in segments)
     total_frames = round(HOLD_BEFORE * fps) + anim_frames + round(HOLD_AFTER * fps)
 
     tsx = generate_slide_tsx(
         slide_num=slide_num,
         slide_name=slide_desc,
-        effect_name=effect_name,
-        duration_sec=duration_sec,
-        root_layer=root_layer,
+        segments=segments,
         tex_map=tex_map,
         fps=fps,
     )
