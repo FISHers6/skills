@@ -53,6 +53,8 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     h = layer['height']
     anchor_x = layer.get('anchor_x', 0.5)
     anchor_y = layer.get('anchor_y', 0.5)
+    initial_scale = layer.get('scale', 1.0)
+    initial_rotation = layer.get('rotation', 0.0)
     initial_opacity = layer['opacity']
     initial_hidden = layer['hidden']
     texture_id = layer['texture_id']
@@ -79,15 +81,19 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
     hidden_to = initial_hidden
     for anim in anims:
         if anim['property'] == 'hidden':
-            if anim['from_val'] is not None: hidden_from = bool(anim['from_val'])
-            if anim['to_val'] is not None:   hidden_to   = bool(anim['to_val'])
+            # Respect delayed hidden animations. A hidden=True animation that starts
+            # later in the transition must not force the layer invisible at frame 0.
+            if anim['begin_time'] <= 1e-6 and anim['from_val'] is not None:
+                hidden_from = bool(anim['from_val'])
+            if anim['to_val'] is not None:
+                hidden_to = bool(anim['to_val'])
 
     # Collect animation from/to values
     tx_from = ty_from = 0.0
     tx_to = ty_to = 0.0
-    sx_from = sy_from = 1.0
-    sx_to = sy_to = 1.0
-    rz_from = rz_to = 0.0
+    sx_from = sy_from = initial_scale
+    sx_to = sy_to = initial_scale
+    rz_from = rz_to = initial_rotation
     # Seed opacity from initialState, but force 0 when hidden
     op_from = 0.0 if hidden_from else initial_opacity
     op_to   = 0.0 if hidden_to   else initial_opacity
@@ -202,9 +208,12 @@ def _gen_layer(layer: dict, tex_map: dict, slide_num: int, var_prefix: str, line
             transform_parts.append(f'scaleY({_fmt(sy_from)})')
         if rz_from != rz_to:
             transform_parts.append(f'rotate(${{{p}_rz}}rad)')
+        elif rz_from != 0.0:
+            transform_parts.append(f'rotate({_fmt(rz_from)}rad)')
     else:
         if sx_from != 1.0: transform_parts.append(f'scaleX({_fmt(sx_from)})')
         if sy_from != 1.0: transform_parts.append(f'scaleY({_fmt(sy_from)})')
+        if rz_from != 0.0: transform_parts.append(f'rotate({_fmt(rz_from)}rad)')
 
     if transform_parts:
         transform_str = ' '.join(transform_parts)

@@ -31,6 +31,7 @@ Directory structure expected:
 """
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -39,7 +40,7 @@ from pathlib import Path
 script_dir = Path(__file__).parent.resolve()
 sys.path.insert(0, str(script_dir))
 
-from parse_layers import parse_effect_layers
+from parse_layers import parse_layer
 from generate_tsx import generate_slide_tsx, HOLD_BEFORE, HOLD_AFTER
 
 
@@ -50,6 +51,77 @@ def get_slide_description(data: dict) -> str:
         if joined:
             return joined[:60]
     return ''
+
+
+def _collect_texture_ids(layer: dict) -> tuple[str, ...]:
+    textures: list[str] = []
+    texture_id = layer.get('texture')
+    if isinstance(texture_id, str):
+        textures.append(texture_id)
+    for child in layer.get('layers', []):
+        textures.extend(_collect_texture_ids(child))
+    return tuple(textures)
+
+
+def _layer_signature(layer: dict) -> tuple:
+    state = layer.get('initialState', {})
+    pos = state.get('position', {})
+    return (
+        layer.get('texture'),
+        round(float(state.get('width', 0)), 3),
+        round(float(state.get('height', 0)), 3),
+        round(float(pos.get('pointX', 0)), 3),
+        round(float(pos.get('pointY', 0)), 3),
+        len(layer.get('layers', [])),
+        _collect_texture_ids(layer),
+    )
+
+
+def _find_matching_paths(layer: dict, matcher, path: tuple[int, ...] = ()) -> list[tuple[int, ...]]:
+    matches = []
+    if matcher(layer):
+        matches.append(path)
+    for idx, child in enumerate(layer.get('layers', [])):
+        matches.extend(_find_matching_paths(child, matcher, path + (idx,)))
+    return matches
+
+
+def _replace_layer_at_path(layer: dict, path: tuple[int, ...], replacement: dict) -> dict:
+    if not path:
+        return copy.deepcopy(replacement)
+
+    merged = copy.deepcopy(layer)
+    cursor = merged
+    for idx in path[:-1]:
+        cursor = cursor['layers'][idx]
+    cursor['layers'][path[-1]] = copy.deepcopy(replacement)
+    return merged
+
+
+def merge_effect_base_layer(event_base: dict, effect_base: dict) -> dict:
+    """
+    Keep the full scene from event.baseLayer, then swap in the animated subtree from effect.baseLayer.
+
+    Keynote often stores only the animated object tree inside effect.baseLayer. Rendering that tree by
+    itself drops static siblings such as dark backgrounds, chopsticks/spoons, or other non-animated
+    scene elements. Matching by objectID is the primary path; a structural signature fallback handles
+    rare exports where the animated subtree is missing objectID.
+    """
+    full_scene = copy.deepcopy(event_base)
+    animated_subtree = copy.deepcopy(effect_base)
+
+    effect_object_id = animated_subtree.get('objectID')
+    if effect_object_id:
+        matches = _find_matching_paths(full_scene, lambda layer: layer.get('objectID') == effect_object_id)
+        if len(matches) == 1:
+            return _replace_layer_at_path(full_scene, matches[0], animated_subtree)
+
+    signature = _layer_signature(animated_subtree)
+    matches = _find_matching_paths(full_scene, lambda layer: _layer_signature(layer) == signature)
+    if len(matches) == 1:
+        return _replace_layer_at_path(full_scene, matches[0], animated_subtree)
+
+    return full_scene
 
 
 def generate_root_tsx(registry: list, src_dir: Path, fps: int = 30, width: int = 1920, height: int = 1080):
@@ -96,14 +168,13 @@ def transpile_slide(slide_num: int, slide_id: str, base: Path, all_tex: dict, fp
     duration_sec = float(effect.get('duration', 0.001))
     slide_desc = get_slide_description(data)
 
-    if effect:
-        root_layer = parse_effect_layers(effect)
+    if effect and effect.get('baseLayer'):
+        merged_base = merge_effect_base_layer(event['baseLayer'], effect['baseLayer'])
+        root_layer = parse_layer(merged_base)
     else:
-        root_layer = {
-            'children': [], 'anims': [], 'texture_id': None,
-            'left': 0, 'top': 0, 'width': 1920, 'height': 1080,
-            'opacity': 1, 'hidden': False,
-        }
+        # Static slides still store their full visual tree in event.baseLayer.
+        # Falling back to an empty root turns them into blank white pages.
+        root_layer = parse_layer(event['baseLayer'])
 
     anim_frames = max(1, round(duration_sec * fps))
     total_frames = round(HOLD_BEFORE * fps) + anim_frames + round(HOLD_AFTER * fps)

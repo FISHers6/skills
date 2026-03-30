@@ -6,6 +6,8 @@ Layer dict schema:
   left, top          - CSS position relative to parent (px, float)
   width, height      - CSS size (px, float)
   anchor_x, anchor_y - anchorPoint (0.0-1.0, controls transform-origin)
+  scale              - static initialState scale (uniform, float)
+  rotation           - static initialState rotation in radians (float)
   opacity            - initial opacity (0.0-1.0)
   hidden             - initial visibility (bool)
   z_position         - z-order value (float, default 0.0). Extracted from CAAnimationGroup
@@ -39,6 +41,8 @@ def _parse_value(val):
     """Extract typed value from Keynote animation value dict."""
     if val is None:
         return None
+    if 'scalar' in val and isinstance(val['scalar'], bool):
+        return bool(val['scalar'])
     if 'scalar' in val:
         return float(val['scalar'])
     if 'pointX' in val:
@@ -151,6 +155,8 @@ def parse_layer(layer: dict) -> dict:
         'height': h,
         'anchor_x': anchor_x,
         'anchor_y': anchor_y,
+        'scale': float(s.get('scale', 1.0)),
+        'rotation': float(s.get('rotation', 0.0)),
         'opacity': float(s.get('opacity', 1.0)),
         'hidden': bool(s.get('hidden', False)),
         'z_position': z_position,
